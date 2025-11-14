@@ -35,7 +35,9 @@ EchoSense is an Android application that records conversations, identifies speak
 
 ## 📸 UI Preview
 
-![EchoSense UI](assets/echosence_UI.jpg)
+![EchoSense UI](assets/UI1.jpg)
+---
+![EchoSense UI](assets/UI2.jpg)
 ---
 
 

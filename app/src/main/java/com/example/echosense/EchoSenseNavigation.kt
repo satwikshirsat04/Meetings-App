@@ -10,7 +10,9 @@ import com.echosense.ui.screens.*
 
 sealed class Screen(val route: String) {
     object Home : Screen("home")
-    object LiveCapture : Screen("live_capture")
+    object LiveCapture : Screen("live_capture/{speakerCount}") {
+        fun createRoute(speakerCount: Int) = "live_capture/$speakerCount"
+    }
     object SessionSummary : Screen("session_summary/{sessionId}") {
         fun createRoute(sessionId: Long) = "session_summary/$sessionId"
     }
@@ -31,8 +33,15 @@ fun EchoSenseNavigation() {
             HomeScreen(navController)
         }
         
-        composable(Screen.LiveCapture.route) {
-            LiveCaptureScreen(navController)
+        composable(
+            route = Screen.LiveCapture.route,
+            arguments = listOf(navArgument("speakerCount") { 
+                type = NavType.IntType
+                defaultValue = 4
+            })
+        ) { backStackEntry ->
+            val speakerCount = backStackEntry.arguments?.getInt("speakerCount") ?: 4
+            LiveCaptureScreen(navController, speakerCount)
         }
         
         composable(

@@ -5,7 +5,10 @@ import androidx.compose.animation.core.*
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
@@ -29,11 +32,13 @@ import com.google.accompanist.permissions.rememberMultiplePermissionsState
 @Composable
 fun HomeScreen(navController: NavController) {
     val permissionsState = rememberMultiplePermissionsState(
-        permissions = listOf(
-            Manifest.permission.RECORD_AUDIO
-        )
+        permissions = listOf(Manifest.permission.RECORD_AUDIO)
     )
-    
+
+    var showSpeakerDialog by remember { mutableStateOf(false) }
+    var selectedSpeakerCount by remember { mutableStateOf(4) }
+
+    // pulsing animation
     val infiniteTransition = rememberInfiniteTransition(label = "pulse")
     val scale by infiniteTransition.animateFloat(
         initialValue = 1f,
@@ -44,40 +49,80 @@ fun HomeScreen(navController: NavController) {
         ),
         label = "scale"
     )
-    
+
     Box(
         modifier = Modifier
             .fillMaxSize()
             .background(Color(0xFF0A0A0A))
     ) {
         Column(
-            modifier = Modifier.fillMaxSize(),
+            modifier = Modifier
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState()),   // ⭐ ADDED SCROLL
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             Spacer(modifier = Modifier.height(48.dp))
-            
-            // App Title
+
             Text(
                 text = "EchoSense",
                 fontSize = 36.sp,
                 fontWeight = FontWeight.Bold,
                 color = Color.White
             )
-            
+
             Text(
                 text = "AI-Powered Conversation Analysis",
                 fontSize = 14.sp,
                 color = Color(0xFFAAAAAA),
                 modifier = Modifier.padding(top = 8.dp)
             )
-            
-            Spacer(modifier = Modifier.height(100.dp))
-            
-            // Main Mic Button with glow effect
-            Box(
-                contentAlignment = Alignment.Center
+
+            Spacer(modifier = Modifier.height(60.dp))
+
+            // Speaker selector card
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 32.dp),
+                shape = RoundedCornerShape(12.dp),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFF1A1A1A))
             ) {
-                // Outer glow ring
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { showSpeakerDialog = true }
+                        .padding(16.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            imageVector = Icons.Default.People,
+                            contentDescription = "Speakers",
+                            tint = Color(0xFF00BCD4),
+                            modifier = Modifier.size(24.dp)
+                        )
+                        Spacer(modifier = Modifier.width(12.dp))
+                        Text(
+                            text = "Number of Speakers: $selectedSpeakerCount",
+                            fontSize = 16.sp,
+                            color = Color.White,
+                            fontWeight = FontWeight.Medium
+                        )
+                    }
+                    Icon(
+                        imageVector = Icons.Default.Edit,
+                        contentDescription = "Edit",
+                        tint = Color(0xFF00BCD4),
+                        modifier = Modifier.size(20.dp)
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(40.dp))
+
+            // Mic Button + Glow
+            Box(contentAlignment = Alignment.Center) {
                 Box(
                     modifier = Modifier
                         .size(220.dp)
@@ -92,8 +137,7 @@ fun HomeScreen(navController: NavController) {
                             )
                         )
                 )
-                
-                // Main button
+
                 Box(
                     modifier = Modifier
                         .size(180.dp)
@@ -101,7 +145,9 @@ fun HomeScreen(navController: NavController) {
                         .background(Color(0xFF1A1A1A))
                         .clickable {
                             if (permissionsState.allPermissionsGranted) {
-                                navController.navigate(Screen.LiveCapture.route)
+                                navController.navigate(
+                                    Screen.LiveCapture.createRoute(selectedSpeakerCount)
+                                )
                             } else {
                                 permissionsState.launchMultiplePermissionRequest()
                             }
@@ -131,96 +177,154 @@ fun HomeScreen(navController: NavController) {
                     }
                 }
             }
-            
+
             Spacer(modifier = Modifier.height(32.dp))
-            
+
             Text(
                 text = "Tap to Start Recording",
                 fontSize = 18.sp,
                 color = Color.White,
                 fontWeight = FontWeight.Medium
             )
-            
+
             Text(
-                text = "Smart offline/online speech recognition",
+                text = "Smart offline speech recognition",
                 fontSize = 12.sp,
                 color = Color(0xFFAAAAAA),
                 modifier = Modifier.padding(top = 8.dp)
             )
-            
+
             Spacer(modifier = Modifier.height(48.dp))
-            
-            // Speaker Indicators
+
+            // Speaker Preview
             Row(
                 horizontalArrangement = Arrangement.spacedBy(16.dp),
                 modifier = Modifier.padding(horizontal = 16.dp)
             ) {
-                SpeakerIndicator(number = 1, color = Color(0xFF00BCD4), isActive = false)
-                SpeakerIndicator(number = 2, color = Color(0xFFFF9800), isActive = false)
-                SpeakerIndicator(number = 3, color = Color(0xFF9C27B0), isActive = false)
-                SpeakerIndicator(number = 4, color = Color(0xFF4CAF50), isActive = false)
+                repeat(selectedSpeakerCount) { index ->
+                    val colors = listOf(
+                        Color(0xFF00BCD4),
+                        Color(0xFFFF9800),
+                        Color(0xFF9C27B0),
+                        Color(0xFF4CAF50),
+                        Color(0xFFE91E63),
+                        Color(0xFFFFEB3B)
+                    )
+                    SpeakerIndicator(
+                        number = index + 1,
+                        color = colors[index % colors.size],
+                        isActive = false
+                    )
+                }
             }
-            
+
             Text(
                 text = "Automatic speaker detection",
                 fontSize = 11.sp,
                 color = Color(0xFFAAAAAA),
                 modifier = Modifier.padding(top = 12.dp)
             )
-            
-            Spacer(modifier = Modifier.weight(1f))
-            
-            // Features list
+
+            Spacer(modifier = Modifier.height(24.dp))
+
+            // Feature list
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(horizontal = 32.dp, vertical = 16.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                FeatureItem(
-                    icon = Icons.Default.Mic,
-                    text = "Real-time Speech Recognition"
-                )
-                FeatureItem(
-                    icon = Icons.Default.CloudOff,
-                    text = "Works Offline (when available)"
-                )
-                FeatureItem(
-                    icon = Icons.Default.People,
-                    text = "Speaker Diarization"
-                )
-                FeatureItem(
-                    icon = Icons.Default.Note,
-                    text = "Auto Note Extraction"
-                )
+                FeatureItem(icon = Icons.Default.Mic, text = "Real-time Speech Recognition")
+                FeatureItem(icon = Icons.Default.CloudOff, text = "Works Offline (when available)")
+                FeatureItem(icon = Icons.Default.People, text = "Speaker Diarization")
+                FeatureItem(icon = Icons.Default.Note, text = "Auto Note Extraction")
             }
-            
-            Spacer(modifier = Modifier.height(16.dp))
-            
-            // Bottom Navigation Buttons
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(bottom = 32.dp),
-                horizontalArrangement = Arrangement.SpaceEvenly
+
+            Spacer(modifier = Modifier.height(24.dp))
+
+            // Bottom Navigation
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                color = Color(0xFF1A1A1A),
+                shadowElevation = 8.dp
             ) {
-                BottomNavButton(
-                    icon = Icons.Default.Description,
-                    label = "Notes",
-                    onClick = { navController.navigate(Screen.Notes.route) }
-                )
-                BottomNavButton(
-                    icon = Icons.Default.History,
-                    label = "History",
-                    onClick = { navController.navigate(Screen.History.route) }
-                )
-                BottomNavButton(
-                    icon = Icons.Default.Settings,
-                    label = "Settings",
-                    onClick = { navController.navigate(Screen.Settings.route) }
-                )
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 24.dp, horizontal = 16.dp),
+                    horizontalArrangement = Arrangement.SpaceEvenly
+                ) {
+                    BottomNavButton(
+                        icon = Icons.Default.Description,
+                        label = "Notes",
+                        onClick = { navController.navigate(Screen.Notes.route) }
+                    )
+                    BottomNavButton(
+                        icon = Icons.Default.History,
+                        label = "History",
+                        onClick = { navController.navigate(Screen.History.route) }
+                    )
+                    BottomNavButton(
+                        icon = Icons.Default.Settings,
+                        label = "Settings",
+                        onClick = { navController.navigate(Screen.Settings.route) }
+                    )
+                }
             }
+
+            Spacer(modifier = Modifier.height(24.dp))
         }
+    }
+
+    // Speaker Dialog
+    if (showSpeakerDialog) {
+        AlertDialog(
+            onDismissRequest = { showSpeakerDialog = false },
+            title = {
+                Text("Select Number of Speakers", color = Color.White)
+            },
+            text = {
+                Column {
+                    (2..6).forEach { count ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable {
+                                    selectedSpeakerCount = count
+                                    showSpeakerDialog = false
+                                }
+                                .padding(vertical = 12.dp, horizontal = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            RadioButton(
+                                selected = selectedSpeakerCount == count,
+                                onClick = {
+                                    selectedSpeakerCount = count
+                                    showSpeakerDialog = false
+                                },
+                                colors = RadioButtonDefaults.colors(
+                                    selectedColor = Color(0xFF00BCD4),
+                                    unselectedColor = Color.Gray
+                                )
+                            )
+                            Spacer(modifier = Modifier.width(12.dp))
+                            Text(
+                                text = "$count Speakers",
+                                fontSize = 16.sp,
+                                color = Color.White
+                            )
+                        }
+                    }
+                }
+            },
+            confirmButton = {},
+            dismissButton = {
+                TextButton(onClick = { showSpeakerDialog = false }) {
+                    Text("Cancel", color = Color(0xFF00BCD4))
+                }
+            },
+            containerColor = Color(0xFF1A1A1A)
+        )
     }
 }
 
@@ -256,9 +360,7 @@ fun SpeakerIndicator(number: Int, color: Color, isActive: Boolean) {
 
 @Composable
 fun FeatureItem(icon: ImageVector, text: String) {
-    Row(
-        verticalAlignment = Alignment.CenterVertically
-    ) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
         Icon(
             imageVector = icon,
             contentDescription = null,
@@ -280,19 +382,31 @@ fun BottomNavButton(icon: ImageVector, label: String, onClick: () -> Unit) {
         horizontalAlignment = Alignment.CenterHorizontally,
         modifier = Modifier
             .clickable(onClick = onClick)
-            .padding(16.dp)
+            .padding(12.dp)
     ) {
-        Icon(
-            imageVector = icon,
-            contentDescription = label,
-            tint = Color.White,
-            modifier = Modifier.size(28.dp)
-        )
-        Spacer(modifier = Modifier.height(4.dp))
+        Surface(
+            shape = CircleShape,
+            color = Color(0xFF00BCD4).copy(alpha = 0.2f),
+            modifier = Modifier.size(56.dp)
+        ) {
+            Box(
+                contentAlignment = Alignment.Center,
+                modifier = Modifier.fillMaxSize()
+            ) {
+                Icon(
+                    imageVector = icon,
+                    contentDescription = label,
+                    tint = Color(0xFF00BCD4),
+                    modifier = Modifier.size(28.dp)
+                )
+            }
+        }
+        Spacer(modifier = Modifier.height(8.dp))
         Text(
             text = label,
-            fontSize = 12.sp,
-            color = Color.White
+            fontSize = 13.sp,
+            color = Color.White,
+            fontWeight = FontWeight.Medium
         )
     }
 }

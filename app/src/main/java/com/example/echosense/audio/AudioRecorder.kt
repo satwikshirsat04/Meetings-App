@@ -1,4 +1,4 @@
-package com.echosense.audio
+package com.example.echosense.audio
 
 import android.media.AudioFormat
 import android.media.AudioRecord
@@ -8,101 +8,129 @@ import java.io.File
 import java.io.FileOutputStream
 import kotlin.math.abs
 
+/**
+ * AudioRecorder that emits fixed-size ShortArray frames (320 samples = 20ms @ 16kHz).
+ * Safe for feeding into Vosk when framed/accumulated by ViewModel.
+ */
 class AudioRecorder {
-    
+
     private var audioRecord: AudioRecord? = null
-    private var isRecording = false
+    @Volatile private var isRecording = false
     private var recordingJob: Job? = null
-    
+
     private val sampleRate = 16000
     private val channelConfig = AudioFormat.CHANNEL_IN_MONO
     private val audioFormat = AudioFormat.ENCODING_PCM_16BIT
-    private val bufferSize = AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioFormat)
-    
-    private val audioDataListeners = mutableListOf<(ShortArray, Int) -> Unit>()
+
+    // 20 ms frames -> 320 samples @ 16kHz
+    private val frameSize = 320
+    private val minBufferSize = AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioFormat)
+    private val bufferSizeInBytes = if (minBufferSize <= 0) frameSize * 2 * 4 else minBufferSize
+
+    private val audioDataListeners = mutableListOf<(ShortArray) -> Unit>()
     private val amplitudeListeners = mutableListOf<(Float) -> Unit>()
-    
-    fun addAudioDataListener(listener: (ShortArray, Int) -> Unit) {
+
+    fun addAudioDataListener(listener: (ShortArray) -> Unit) {
         audioDataListeners.add(listener)
     }
-    
+
+    fun removeAudioDataListener(listener: (ShortArray) -> Unit) {
+        audioDataListeners.remove(listener)
+    }
+
     fun addAmplitudeListener(listener: (Float) -> Unit) {
         amplitudeListeners.add(listener)
     }
-    
+
+    fun removeAmplitudeListener(listener: (Float) -> Unit) {
+        amplitudeListeners.remove(listener)
+    }
+
+    /**
+     * Start recording. If outputFile is provided, raw PCM16 LE bytes are written to that file.
+     * Returns true if recording started successfully.
+     */
     fun startRecording(outputFile: File? = null): Boolean {
-        if (isRecording) return false
-        
+        if (isRecording) return true
+
         try {
             audioRecord = AudioRecord(
                 MediaRecorder.AudioSource.MIC,
                 sampleRate,
                 channelConfig,
                 audioFormat,
-                bufferSize
+                bufferSizeInBytes
             )
-            
+
             if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
+                audioRecord?.release()
+                audioRecord = null
                 return false
             }
-            
+
             audioRecord?.startRecording()
             isRecording = true
-            
+
+            val frameBuffer = ShortArray(frameSize)
+            val fileOut = outputFile?.let { FileOutputStream(it) }
+
             recordingJob = CoroutineScope(Dispatchers.IO).launch {
-                val buffer = ShortArray(bufferSize / 2)
-                val fileOutputStream = outputFile?.let { FileOutputStream(it) }
-                
-                while (isRecording && isActive) {
-                    val readSize = audioRecord?.read(buffer, 0, buffer.size) ?: 0
-                    
-                    if (readSize > 0) {
-                        // Write to file
-                        fileOutputStream?.let {
-                            val byteBuffer = java.nio.ByteBuffer.allocate(readSize * 2)
-                            byteBuffer.order(java.nio.ByteOrder.LITTLE_ENDIAN)
-                            for (i in 0 until readSize) {
-                                byteBuffer.putShort(buffer[i])
-                            }
-                            it.write(byteBuffer.array())
+                try {
+                    while (isRecording && isActive) {
+                        val read = audioRecord?.read(frameBuffer, 0, frameSize) ?: 0
+                        if (read == frameSize) {
+                            // Notify listeners with a copy (so downstream can modify safely)
+                            val copied = frameBuffer.copyOf()
+                            audioDataListeners.forEach { it(copied) }
+
+                            // amplitude (normalized 0..1)
+                            val amp = frameBuffer.map { abs(it.toInt()) }.average().toFloat() / 32768f
+                            amplitudeListeners.forEach { it(amp) }
+
+                            // Write to file if requested (PCM16 LE)
+                            fileOut?.write(copied.toByteArrayLittleEndian())
+                        } else {
+                            // small pause to avoid busy spin if read isn't full frame
+                            delay(2)
                         }
-                        
-                        // Notify listeners
-                        audioDataListeners.forEach { listener ->
-                            listener(buffer.copyOf(readSize), readSize)
-                        }
-                        
-                        // Calculate amplitude
-                        val amplitude = calculateAmplitude(buffer, readSize)
-                        amplitudeListeners.forEach { it(amplitude) }
                     }
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                } finally {
+                    try { fileOut?.close() } catch (_: Exception) {}
                 }
-                
-                fileOutputStream?.close()
             }
-            
+
             return true
         } catch (e: Exception) {
             e.printStackTrace()
             return false
         }
     }
-    
+
     fun stopRecording() {
         isRecording = false
-        recordingJob?.cancel()
-        audioRecord?.stop()
-        audioRecord?.release()
+        try { recordingJob?.cancel() } catch (_: Exception) {}
+        recordingJob = null
+        try {
+            audioRecord?.stop()
+        } catch (_: Exception) {}
+        try {
+            audioRecord?.release()
+        } catch (_: Exception) {}
         audioRecord = null
     }
-    
-    private fun calculateAmplitude(buffer: ShortArray, size: Int): Float {
-        var sum = 0.0
-        for (i in 0 until size) {
-            sum += abs(buffer[i].toDouble())
-        }
-        return (sum / size).toFloat()
-    }
-    
+
     fun getSampleRate() = sampleRate
+}
+
+// Helper: convert ShortArray -> ByteArray Little Endian
+private fun ShortArray.toByteArrayLittleEndian(): ByteArray {
+    val b = ByteArray(this.size * 2)
+    for (i in this.indices) {
+        val v = this[i].toInt()
+        b[i * 2] = (v and 0xFF).toByte()
+        b[i * 2 + 1] = ((v shr 8) and 0xFF).toByte()
+    }
+    return b
 }

@@ -28,6 +28,19 @@ interface SessionDao {
     @Query("SELECT * FROM speakers WHERE sessionId = :sessionId")
     suspend fun getSpeakersForSession(sessionId: Long): List<Speaker>
     
+    // ADD THESE CRITICAL METHODS:
+    @Query("SELECT * FROM speakers WHERE sessionId = :sessionId AND id = :speakerId")
+    suspend fun getSpeaker(sessionId: Long, speakerId: Long): Speaker?
+    
+    @Query("SELECT COUNT(DISTINCT speakerId) FROM transcript_entries WHERE sessionId = :sessionId")
+    suspend fun getUniqueSpeakerCount(sessionId: Long): Int
+    
+    @Query("SELECT COUNT(*) FROM speakers WHERE sessionId = :sessionId")
+    suspend fun getSpeakerCount(sessionId: Long): Int
+    
+    @Query("DELETE FROM speakers WHERE sessionId = :sessionId AND id = :speakerId")
+    suspend fun deleteSpeaker(sessionId: Long, speakerId: Long)
+    
     @Insert
     suspend fun insertTranscriptEntry(entry: TranscriptEntry): Long
     
@@ -42,4 +55,17 @@ interface SessionDao {
     
     @Query("DELETE FROM transcript_entries WHERE sessionId = :sessionId")
     suspend fun deleteTranscriptForSession(sessionId: Long)
+    
+    // Clear all tables (for settings)
+    @Query("DELETE FROM sessions")
+    suspend fun clearAllSessions()
+    
+    @Query("DELETE FROM speakers")
+    suspend fun clearAllSpeakers()
+    
+    @Query("DELETE FROM transcript_entries")
+    suspend fun clearAllTranscripts()
+    
+    @Query("DELETE FROM notes")
+    suspend fun clearAllNotes()
 }

@@ -2,7 +2,9 @@ package com.echosense.ui.screens
 
 import android.os.SystemClock
 import androidx.compose.animation.core.*
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -15,11 +17,14 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
-import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.draw.scale
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -31,6 +36,8 @@ import com.echosense.viewmodels.LiveCaptureViewModel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.util.concurrent.TimeUnit
+import kotlin.math.sin
+import kotlin.random.Random
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -142,37 +149,67 @@ fun LiveCaptureScreen(
                 )
             }
 
-            // Enhanced Waveform
-            EnhancedWaveformVisualization(
+            // Dynamic Waveform with actual amplitude
+            DynamicWaveformVisualization(
                 amplitude = uiState.currentAmplitude,
                 isActive = uiState.isListening
             )
 
             Spacer(modifier = Modifier.height(24.dp))
 
-            // Dynamic Speaker Circles based on selected count
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 16.dp),
-                horizontalArrangement = Arrangement.SpaceEvenly
-            ) {
-                val colors = listOf(
-                    Color(0xFF00BCD4),
-                    Color(0xFFFF9800),
-                    Color(0xFF9C27B0),
-                    Color(0xFF4CAF50),
-                    Color(0xFFE91E63),
-                    Color(0xFFFFEB3B)
-                )
-
-                repeat(speakerCount) { index ->
-                    EnhancedSpeakerCircle(
-                        number = index + 1,
-                        color = colors[index % colors.size],
-                        isActive = uiState.activeSpeaker == index,
-                        speakingLevel = if (uiState.activeSpeaker == index) uiState.currentAmplitude else 0f
+            // Dynamic Speaker Circles with circular rotating glow
+            // Use scrollable row for 5-6 speakers, regular for 2-4
+            if (speakerCount <= 4) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp),
+                    horizontalArrangement = Arrangement.SpaceEvenly
+                ) {
+                    val colors = listOf(
+                        Color(0xFF00BCD4),
+                        Color(0xFFFF9800),
+                        Color(0xFF9C27B0),
+                        Color(0xFF4CAF50),
+                        Color(0xFFE91E63),
+                        Color(0xFFFFEB3B)
                     )
+
+                    repeat(speakerCount) { index ->
+                        SpeakerCircleWithRotatingGlow(
+                            number = index + 1,
+                            color = colors[index % colors.size],
+                            isActive = uiState.activeSpeaker == index,
+                            speakingLevel = if (uiState.activeSpeaker == index) uiState.currentAmplitude else 0f
+                        )
+                    }
+                }
+            } else {
+                // Scrollable row for 5-6 speakers
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp)
+                        .horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(16.dp)
+                ) {
+                    val colors = listOf(
+                        Color(0xFF00BCD4),
+                        Color(0xFFFF9800),
+                        Color(0xFF9C27B0),
+                        Color(0xFF4CAF50),
+                        Color(0xFFE91E63),
+                        Color(0xFFFFEB3B)
+                    )
+
+                    repeat(speakerCount) { index ->
+                        SpeakerCircleWithRotatingGlow(
+                            number = index + 1,
+                            color = colors[index % colors.size],
+                            isActive = uiState.activeSpeaker == index,
+                            speakingLevel = if (uiState.activeSpeaker == index) uiState.currentAmplitude else 0f
+                        )
+                    }
                 }
             }
 
@@ -328,6 +365,210 @@ fun LiveCaptureScreen(
     }
 }
 
+// ======================== DYNAMIC WAVEFORM WITH ACTUAL AMPLITUDE ========================
+@Composable
+fun DynamicWaveformVisualization(amplitude: Float, isActive: Boolean) {
+    // Store bar heights to create smooth transitions
+    val barHeights = remember { mutableStateListOf<Float>().apply { repeat(30) { add(0.3f) } } }
+
+    // Update bar heights based on actual amplitude
+    LaunchedEffect(amplitude, isActive) {
+        while (isActive) {
+            // Shift heights to create wave effect
+            for (i in barHeights.indices.reversed()) {
+                if (i == 0) {
+                    // New bar height based on actual amplitude with some randomness
+                    val newHeight = if (amplitude > 0.01f) {
+                        amplitude.coerceIn(0.2f, 1f) + (Random.nextFloat() * 0.2f - 0.1f)
+                    } else {
+                        0.2f + (Random.nextFloat() * 0.1f)
+                    }
+                    barHeights[i] = newHeight.coerceIn(0.2f, 1f)
+                } else {
+                    // Smooth transition from previous bar
+                    barHeights[i] = barHeights[i - 1] * 0.95f
+                }
+            }
+            delay(50) // Update every 50ms for smooth animation
+        }
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(100.dp)
+            .padding(horizontal = 16.dp)
+            .clip(RoundedCornerShape(16.dp))
+            .background(Color(0xFF1A1A1A)),
+        contentAlignment = Alignment.Center
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            horizontalArrangement = Arrangement.SpaceEvenly,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            barHeights.forEachIndexed { index, heightFactor ->
+                val baseHeight = 20.dp
+                val maxHeight = 70.dp
+                val height = baseHeight + ((maxHeight - baseHeight) * heightFactor)
+
+                Box(
+                    modifier = Modifier
+                        .width(3.dp)
+                        .height(height)
+                        .clip(RoundedCornerShape(2.dp))
+                        .background(
+                            brush = Brush.verticalGradient(
+                                colors = listOf(
+                                    Color(0xFF00BCD4),
+                                    Color(0xFF00BCD4).copy(alpha = 0.5f)
+                                )
+                            )
+                        )
+                )
+            }
+        }
+    }
+}
+
+// ======================== SPEAKER WITH CIRCULAR ROTATING GLOW ========================
+@Composable
+fun SpeakerCircleWithRotatingGlow(
+    number: Int,
+    color: Color,
+    isActive: Boolean,
+    speakingLevel: Float
+) {
+    val scale by animateFloatAsState(
+        targetValue = if (isActive) 1.15f else 1f,
+        animationSpec = spring(
+            dampingRatio = Spring.DampingRatioMediumBouncy,
+            stiffness = Spring.StiffnessLow
+        ),
+        label = "scale"
+    )
+
+    // Rotation animation for the glow ring
+    val infiniteTransition = rememberInfiniteTransition(label = "glowRotation")
+    val rotation by infiniteTransition.animateFloat(
+        initialValue = 0f,
+        targetValue = 360f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(3000, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "rotation"
+    )
+
+    // Pulsing glow intensity
+    val glowIntensity by infiniteTransition.animateFloat(
+        initialValue = 0.4f,
+        targetValue = 0.8f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(1000, easing = EaseInOut),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "glowIntensity"
+    )
+
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier = Modifier.size(90.dp)
+    ) {
+        // Rotating circular glow effect
+        if (isActive) {
+            Canvas(
+                modifier = Modifier
+                    .size(85.dp)
+                    .rotate(rotation)
+            ) {
+                val radius = size.minDimension / 2
+                val center = Offset(size.width / 2, size.height / 2)
+
+                // Draw multiple circular rings for depth
+                for (i in 0..2) {
+                    drawCircle(
+                        brush = Brush.radialGradient(
+                            colors = listOf(
+                                color.copy(alpha = glowIntensity * (0.6f - i * 0.2f)),
+                                Color.Transparent
+                            ),
+                            center = center,
+                            radius = radius + (i * 10f)
+                        ),
+                        radius = radius + (i * 10f),
+                        center = center
+                    )
+                }
+
+                // Animated arc segments for rotation effect
+                for (angle in 0..360 step 60) {
+                    val path = Path().apply {
+                        addArc(
+                            oval = androidx.compose.ui.geometry.Rect(
+                                center.x - radius,
+                                center.y - radius,
+                                center.x + radius,
+                                center.y + radius
+                            ),
+                            startAngleDegrees = angle.toFloat(),
+                            sweepAngleDegrees = 30f
+                        )
+                    }
+                    drawPath(
+                        path = path,
+                        color = color.copy(alpha = glowIntensity * 0.5f),
+                        style = Stroke(width = 3f)
+                    )
+                }
+            }
+        }
+
+        // Speaker circle
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Card(
+                modifier = Modifier
+                    .size(65.dp)
+                    .scale(scale),
+                shape = CircleShape,
+                colors = CardDefaults.cardColors(
+                    containerColor = if (isActive) color else color.copy(alpha = 0.3f)
+                ),
+                elevation = CardDefaults.cardElevation(
+                    defaultElevation = if (isActive) 12.dp else 4.dp
+                )
+            ) {
+                Box(
+                    modifier = Modifier.fillMaxSize(),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Person,
+                        contentDescription = "Speaker $number",
+                        tint = Color.White,
+                        modifier = Modifier.size(32.dp)
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            Text(
+                text = "Speaker $number",
+                fontSize = 12.sp,
+                color = if (isActive) Color.White else Color.Gray,
+                fontWeight = if (isActive) FontWeight.Bold else FontWeight.Normal
+            )
+        }
+    }
+}
+
+// ======================== REST OF THE COMPOSABLES ========================
+
 @Composable
 fun ProcessingStatusBar(status: String, isActive: Boolean) {
     val backgroundColor = if (isActive) Color(0xFF2196F3).copy(alpha = 0.2f) else Color(0xFF424242)
@@ -439,137 +680,6 @@ fun RecordingIndicator() {
 }
 
 @Composable
-fun EnhancedWaveformVisualization(amplitude: Float, isActive: Boolean) {
-    val infiniteTransition = rememberInfiniteTransition(label = "waveform")
-
-    Box(
-        modifier = Modifier
-            .fillMaxWidth()
-            .height(100.dp)
-            .padding(horizontal = 16.dp)
-            .clip(RoundedCornerShape(16.dp))
-            .background(Color(0xFF1A1A1A)),
-        contentAlignment = Alignment.Center
-    ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(16.dp),
-            horizontalArrangement = Arrangement.SpaceEvenly,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            repeat(30) { index ->
-                val animatedHeight by infiniteTransition.animateFloat(
-                    initialValue = 0.3f,
-                    targetValue = 1f,
-                    animationSpec = infiniteRepeatable(
-                        animation = tween(
-                            durationMillis = 400 + (index * 20),
-                            easing = LinearEasing
-                        ),
-                        repeatMode = RepeatMode.Reverse
-                    ),
-                    label = "bar$index"
-                )
-
-                val baseHeight = 20.dp
-                val maxHeight = 70.dp
-                val heightFactor = if (isActive) amplitude.coerceIn(0.3f, 1f) * animatedHeight else 0.3f
-                val height = baseHeight + ((maxHeight - baseHeight) * heightFactor)
-
-                Box(
-                    modifier = Modifier
-                        .width(3.dp)
-                        .height(height)
-                        .clip(RoundedCornerShape(2.dp))
-                        .background(
-                            brush = Brush.verticalGradient(
-                                colors = listOf(
-                                    Color(0xFF00BCD4),
-                                    Color(0xFF00BCD4).copy(alpha = 0.5f)
-                                )
-                            )
-                        )
-                )
-            }
-        }
-    }
-}
-
-@Composable
-fun EnhancedSpeakerCircle(
-    number: Int,
-    color: Color,
-    isActive: Boolean,
-    speakingLevel: Float
-) {
-    val scale by animateFloatAsState(
-        targetValue = if (isActive) 1.15f else 1f,
-        animationSpec = spring(
-            dampingRatio = Spring.DampingRatioMediumBouncy,
-            stiffness = Spring.StiffnessLow
-        ),
-        label = "scale"
-    )
-
-    val glowAlpha = if (isActive) speakingLevel.coerceIn(0.3f, 0.8f) else 0f
-
-    Box(
-        contentAlignment = Alignment.Center
-    ) {
-        // Glow effect
-        if (isActive) {
-            Box(
-                modifier = Modifier
-                    .size(80.dp)
-                    .scale(1.2f)
-                    .blur(20.dp)
-                    .clip(CircleShape)
-                    .background(color.copy(alpha = glowAlpha))
-            )
-        }
-
-        Column(
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            Card(
-                modifier = Modifier
-                    .size(65.dp)
-                    .scale(scale),
-                shape = CircleShape,
-                colors = CardDefaults.cardColors(
-                    containerColor = if (isActive) color else color.copy(alpha = 0.3f)
-                ),
-                elevation = CardDefaults.cardElevation(
-                    defaultElevation = if (isActive) 12.dp else 4.dp
-                )
-            ) {
-                Box(
-                    modifier = Modifier.fillMaxSize(),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.Person,
-                        contentDescription = "Speaker $number",
-                        tint = Color.White,
-                        modifier = Modifier.size(32.dp)
-                    )
-                }
-            }
-
-            Spacer(modifier = Modifier.height(8.dp))
-
-            Text(
-                text = "Speaker $number",
-                fontSize = 12.sp,
-                color = if (isActive) Color.White else Color.Gray,
-                fontWeight = if (isActive) FontWeight.Bold else FontWeight.Normal
-            )
-        }
-    }
-}
-
-@Composable
 fun LiveIndicator() {
     val infiniteTransition = rememberInfiniteTransition(label = "live")
     val alpha by infiniteTransition.animateFloat(
@@ -628,7 +738,6 @@ fun EnhancedTranscriptItem(
                 .fillMaxWidth(),
             verticalAlignment = Alignment.Top
         ) {
-            // Speaker chip
             Box(
                 modifier = Modifier
                     .size(36.dp)
@@ -684,7 +793,6 @@ fun EnhancedTranscriptItem(
 
 @Composable
 fun PartialTranscriptItem(speakerLabel: String, text: String) {
-    // Slightly dimmed and italic to show it's partial
     Card(
         modifier = Modifier
             .fillMaxWidth()
@@ -757,17 +865,11 @@ fun AnimatedControlButton(
     text: String
 ) {
     val interactionScale = remember { Animatable(1f) }
-
-    LaunchedEffect(interactionScale) {
-        // no-op, keeps animation ready
-    }
-
     val scope = rememberCoroutineScope()
 
     Surface(
         onClick = {
-            // small press animation
-            scope.launch {                  // ← USE THIS INSTEAD OF LaunchedEffect
+            scope.launch {
                 interactionScale.animateTo(0.95f, animationSpec = tween(80))
                 interactionScale.animateTo(1f, animationSpec = tween(120))
             }

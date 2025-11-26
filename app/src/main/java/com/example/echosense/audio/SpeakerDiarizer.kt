@@ -1,371 +1,298 @@
-//
-//
-//
 //package com.echosense.audio
 //
 //import android.util.Log
 //import kotlin.math.*
-//import java.util.concurrent.atomic.AtomicInteger
 //
-///**
-// * Improved Speaker Diarizer – FINAL FIXED VERSION
-// */
 //class SpeakerDiarizer(
 //    private val maxSpeakers: Int = 4,
-//    private var similarityThreshold: Float = 0.60f, // tune 0.55–0.70
-//    private val minSpeechAmplitude: Float = 0.01f,
-//    private val minExamplesToMatch: Int = 2,
-//    private val embeddingWindowSize: Int = 10,
-//    private val warmupFramesBeforeCreate: Int = 2,
-//    private val minSpeakerChangeInterval: Long = 1500L
+//    private val similarityThreshold: Float = 0.95f,  // Lower threshold
+//    private val windowSize: Int = 15,
+//    private val minSwitchDelay: Long = 1000L,  // 1 second
+//    private val confirmationFrames: Int = 2
 //) {
 //
-//    private val audioProcessor = AudioProcessor()
-//    private val speakerProfiles = mutableListOf<SpeakerProfile>()
-//
+//    private val TAG = "DIAR"
+//    private val profiles = mutableListOf<SpeakerProfile>()
 //    private var currentSpeaker: Int? = null
-//    private var lastSpeakerChangeTime = 0L
-//    private val profileIdCounter = AtomicInteger(0)
+//    private var lastSwitchTime = 0L
+//
+//    private var pendingSpeaker: Int? = null
+//    private var pendingConfirmationCount = 0
+//
+//    // Track frame count to avoid premature initialization
+//    private var frameCount = 0
+//    private val MIN_FRAMES_BEFORE_INIT = 5
 //
 //    data class SpeakerProfile(
 //        val id: Int,
-//        val features: MutableList<FloatArray> = mutableListOf(),
-//        var lastActiveTime: Long = 0,
-//        var totalSamples: Int = 0,
-//        var pendingWarmup: Int = 0
+//        val embeddings: MutableList<FloatArray> = mutableListOf(),
+//        var lastActiveTime: Long = 0L,
+//        var totalActiveTime: Long = 0L
 //    )
 //
-//    // -------------------------------------------------------------------
+//    fun reset() {
+//        profiles.clear()
+//        currentSpeaker = null
+//        pendingSpeaker = null
+//        pendingConfirmationCount = 0
+//        lastSwitchTime = 0L
+//        frameCount = 0
+//        Log.d(TAG, "🔄 Reset complete")
+//    }
 //
-//    @Synchronized
-//    fun processAudioSegment(audioData: ShortArray, sampleRate: Int, timestamp: Long): Int? {
-//        try {
-//            // --- Voice Activity Detection ---
-//            if (!isSpeech(audioData)) {
-//                Log.d(TAG, "VAD: silence → stay at current=$currentSpeaker")
-//                return currentSpeaker
+//    fun process(embedding: FloatArray, timestamp: Long): Int? {
+//        if (embedding.isEmpty()) return currentSpeaker
+//
+//        frameCount++
+//
+//        // Wait for a few frames before starting diarization
+//        if (frameCount < MIN_FRAMES_BEFORE_INIT) {
+//            return null
+//        }
+//
+//        // === FIRST SPEAKER INITIALIZATION ===
+//        if (profiles.isEmpty()) {
+//            val firstId = createSpeaker(embedding, timestamp)
+//            currentSpeaker = firstId
+//            lastSwitchTime = timestamp
+//            Log.d(TAG, "🎉 First speaker S${firstId + 1} initialized")
+//            return firstId
+//        }
+//
+//        // === CALCULATE SIMILARITIES ===
+//        val similarities = mutableListOf<Pair<Int, Float>>()
+//
+//        for (profile in profiles) {
+//            if (profile.embeddings.isEmpty()) continue
+//            val centroid = computeCentroid(profile.embeddings)
+//            val sim = cosineSimilarity(embedding, centroid)
+//            similarities.add(profile.id to sim)
+//        }
+//
+//        if (similarities.isEmpty()) return currentSpeaker
+//
+//        // Sort by similarity descending
+//        similarities.sortByDescending { it.second }
+//
+//        val bestMatch = similarities[0]
+//        val bestId = bestMatch.first
+//        val bestSim = bestMatch.second
+//
+//        val secondBestSim = similarities.getOrNull(1)?.second ?: -1f
+//        val margin = bestSim - secondBestSim
+//
+//        // Enhanced logging
+//        val speakerSims = similarities.take(3).map { "S${it.first + 1}:%.3f".format(it.second) }
+//        Log.d(TAG, "📊 Similarities: ${speakerSims.joinToString(", ")}, Margin=%.3f".format(margin))
+//
+//        // === DECISION LOGIC (FIXED) ===
+//        val detectedSpeaker = when {
+//            // CASE 1: Very strong match (> 0.80) - almost certainly same speaker
+//            bestSim >= 0.80f -> {
+//                Log.d(TAG, "✅ Strong match: S${bestId + 1} (sim=%.3f)".format(bestSim))
+//                updateSpeaker(bestId, embedding, timestamp)
+//                bestId
 //            }
 //
-//            val rawMFCC = audioProcessor.extractEnhancedMFCC(audioData, sampleRate)
-//            if (rawMFCC.isEmpty()) {
-//                Log.d(TAG, "DIAR: No MFCC extracted.")
-//                return currentSpeaker
+//            // CASE 2: Good match with clear separation from other speakers
+//            bestSim >= similarityThreshold && margin > 0.15f -> {
+//                Log.d(TAG, "✅ Clear match: S${bestId + 1} (sim=%.3f, margin=%.3f)".format(bestSim, margin))
+//                updateSpeaker(bestId, embedding, timestamp)
+//                bestId
 //            }
 //
-//            val features = l2NormalizeCopy(rawMFCC)
+//            // CASE 3: Ambiguous - multiple speakers with similar scores
+//            // This is the KEY FIX - when margin is small, prefer switching to different speaker
+//            bestSim >= similarityThreshold && margin <= 0.15f -> {
+//                // If current speaker is in the ambiguous range, try switching
+//                val currentSim = similarities.find { it.first == currentSpeaker }?.second ?: -1f
 //
-//            val decidedSpeaker = identifySpeaker(features, timestamp)
-//
-//            if (decidedSpeaker != null && decidedSpeaker != currentSpeaker) {
-//                val now = System.currentTimeMillis()
-//                if (now - lastSpeakerChangeTime >= minSpeakerChangeInterval) {
-//                    Log.d(TAG, "DIAR: SWITCH → $currentSpeaker → $decidedSpeaker")
-//                    currentSpeaker = decidedSpeaker
-//                    lastSpeakerChangeTime = now
+//                if (currentSim >= 0.0f && bestSim - currentSim > 0.05f) {
+//                    // Best match is noticeably better than current speaker
+//                    Log.d(TAG, "🔄 Switching (ambiguous): S${currentSpeaker?.plus(1)} → S${bestId + 1}")
+//                    updateSpeaker(bestId, embedding, timestamp)
+//                    bestId
+//                } else if (currentSpeaker != null) {
+//                    // Stay with current speaker during ambiguity
+//                    Log.d(TAG, "⏸️ Staying: S${currentSpeaker!! + 1} (ambiguous)")
+//                    updateSpeaker(currentSpeaker!!, embedding, timestamp)
+//                    currentSpeaker!!
 //                } else {
-//                    Log.d(TAG, "DIAR: Switch blocked (interval).")
+//                    updateSpeaker(bestId, embedding, timestamp)
+//                    bestId
 //                }
 //            }
 //
-//            currentSpeaker?.let { id ->
-//                speakerProfiles.find { it.id == id }?.lastActiveTime = timestamp
+//            // CASE 4: Low similarity - might be new speaker
+//            profiles.size < maxSpeakers && bestSim < 0.55f -> {
+//                val timeSinceSwitch = timestamp - lastSwitchTime
+//                if (timeSinceSwitch > minSwitchDelay) {
+//                    val newId = createSpeaker(embedding, timestamp)
+//                    Log.d(TAG, "🆕 New speaker S${newId + 1} (sim=%.3f too low)".format(bestSim))
+//                    newId
+//                } else {
+//                    // Too soon to create new speaker, use best match
+//                    updateSpeaker(bestId, embedding, timestamp)
+//                    bestId
+//                }
 //            }
 //
-//            return currentSpeaker
-//
-//        } catch (e: Exception) {
-//            Log.e(TAG, "processAudioSegment ERROR", e)
-//            return currentSpeaker
-//        }
-//    }
-//
-//    // -------------------------------------------------------------------
-//
-//    @Synchronized
-//    fun getSpeakerCount(): Int =
-//        speakerProfiles.count { it.totalSamples >= minExamplesToMatch }
-//
-//    @Synchronized
-//    fun getActiveSpeakers(): List<Int> =
-//        speakerProfiles.map { it.id }
-//
-//    @Synchronized
-//    fun reset() {
-//        speakerProfiles.clear()
-//        currentSpeaker = null
-//        lastSpeakerChangeTime = 0L
-//        profileIdCounter.set(0)
-//        Log.d(TAG, "SpeakerDiarizer RESET")
-//    }
-//
-//    // -------------------------------------------------------------------
-//    // INTERNAL LOGIC
-//    // -------------------------------------------------------------------
-//
-//    private fun isSpeech(audio: ShortArray): Boolean {
-//        var sumSq = 0.0
-//        for (s in audio) sumSq += s * s
-//        val rms = sqrt(sumSq / audio.size) / 32768.0
-//        return rms > minSpeechAmplitude
-//    }
-//
-//    private fun identifySpeaker(features: FloatArray, timestamp: Long): Int? {
-//        Log.d(TAG, "--- identifySpeaker(), profiles=${speakerProfiles.size} ---")
-//
-//        // First ever speaker
-//        if (speakerProfiles.isEmpty()) {
-//            return createWarmupSpeaker(features, timestamp)
-//        }
-//
-//        // Compare against existing profiles
-//        var bestId = -1
-//        var bestSim = -2f
-//
-//        for (profile in speakerProfiles) {
-//            if (profile.features.size < minExamplesToMatch) continue
-//
-//            val avg = averageFeatures(profile.features)
-//            val sim = cosineSimilarity(features, avg)
-//
-//            Log.d(TAG, "DIAR: similarity with speaker ${profile.id} = $sim")
-//
-//            if (sim > bestSim) {
-//                bestSim = sim
-//                bestId = profile.id
+//            // CASE 5: Fallback to best match
+//            else -> {
+//                Log.d(TAG, "➡️ Fallback: S${bestId + 1} (sim=%.3f)".format(bestSim))
+//                updateSpeaker(bestId, embedding, timestamp)
+//                bestId
 //            }
 //        }
 //
-//        Log.d(TAG, "DIAR: BEST=$bestId, SIM=$bestSim, THRESHOLD=$similarityThreshold")
-//
-//        // Assign to existing speaker
-//        if (bestId != -1 && bestSim >= similarityThreshold) {
-//            updateSpeakerProfile(bestId, features, timestamp)
-//            return bestId
-//        }
-//
-//        // Create new speaker if allowed
-//        if (speakerProfiles.size < maxSpeakers) {
-//            return createWarmupSpeaker(features, timestamp)
-//        }
-//
-//        // FINAL FALLBACK (FIXED!)
-//        val fallback = speakerProfiles.maxByOrNull { it.totalSamples }
-//        fallback?.let {
-//            Log.d(TAG, "Fallback to speaker ${it.id}")
-//            updateSpeakerProfile(it.id, features, timestamp)
-//            return it.id
-//        }
-//
-//        return currentSpeaker
+//        // === SMOOTHING ===
+//        return applySmoothing(detectedSpeaker, timestamp)
 //    }
 //
-//    // -------------------------------------------------------------------
+//    private fun applySmoothing(detectedSpeaker: Int, timestamp: Long): Int? {
+//        // No current speaker
+//        if (currentSpeaker == null) {
+//            currentSpeaker = detectedSpeaker
+//            lastSwitchTime = timestamp
+//            Log.d(TAG, "🎤 Started: S${detectedSpeaker + 1}")
+//            return detectedSpeaker
+//        }
 //
-//    private fun createWarmupSpeaker(features: FloatArray, timestamp: Long): Int {
-//        val last = speakerProfiles.lastOrNull()
+//        val current = currentSpeaker!!
 //
-//        if (last != null && last.totalSamples == 0 && last.pendingWarmup > 0) {
-//            last.features.add(features)
-//            last.pendingWarmup++
+//        // Same speaker - reset pending
+//        if (detectedSpeaker == current) {
+//            pendingSpeaker = null
+//            pendingConfirmationCount = 0
+//            return current
+//        }
 //
-//            Log.d(TAG, "Warmup speaker ${last.id}: ${last.pendingWarmup}/$warmupFramesBeforeCreate")
+//        // Different speaker detected
+//        val timeSinceSwitch = timestamp - lastSwitchTime
 //
-//            if (last.pendingWarmup >= warmupFramesBeforeCreate) {
-//                last.totalSamples = last.features.size
-//                last.lastActiveTime = timestamp
-//                Log.d(TAG, "Warmup COMPLETE → Speaker ${last.id} created.")
-//                return last.id
+//        // Too soon to switch
+//        if (timeSinceSwitch < minSwitchDelay) {
+//            Log.d(TAG, "⏳ Switch blocked: too soon (${timeSinceSwitch}ms)")
+//            return current
+//        }
+//
+//        // New pending speaker
+//        if (pendingSpeaker != detectedSpeaker) {
+//            pendingSpeaker = detectedSpeaker
+//            pendingConfirmationCount = 1
+//            Log.d(TAG, "🔄 Pending: S${current + 1} → S${detectedSpeaker + 1} (1/$confirmationFrames)")
+//            return current
+//        }
+//
+//        // Increment confirmation
+//        pendingConfirmationCount++
+//
+//        // Confirmed switch
+//        if (pendingConfirmationCount >= confirmationFrames) {
+//            currentSpeaker = detectedSpeaker
+//            lastSwitchTime = timestamp
+//            pendingSpeaker = null
+//            pendingConfirmationCount = 0
+//
+//            Log.d(TAG, "🎊 SWITCHED: S${current + 1} → S${detectedSpeaker + 1}")
+//            return detectedSpeaker
+//        }
+//
+//        // Still confirming
+//        Log.d(TAG, "🔄 Confirming: S${current + 1} → S${detectedSpeaker + 1} ($pendingConfirmationCount/$confirmationFrames)")
+//        return current
+//    }
+//
+//    private fun createSpeaker(embedding: FloatArray, timestamp: Long): Int {
+//        val newId = profiles.size
+//        val profile = SpeakerProfile(
+//            id = newId,
+//            lastActiveTime = timestamp
+//        )
+//        profile.embeddings.add(embedding)
+//        profiles.add(profile)
+//        Log.d(TAG, "✨ Created Speaker ${newId + 1}. Total speakers: ${profiles.size}")
+//        return newId
+//    }
+//
+//    private fun updateSpeaker(id: Int, embedding: FloatArray, timestamp: Long) {
+//        val profile = profiles.getOrNull(id) ?: return
+//        profile.embeddings.add(embedding)
+//        profile.lastActiveTime = timestamp
+//
+//        // Maintain sliding window
+//        if (profile.embeddings.size > windowSize) {
+//            profile.embeddings.removeAt(0)
+//        }
+//    }
+//
+//    private fun computeCentroid(embeddings: List<FloatArray>): FloatArray {
+//        if (embeddings.isEmpty()) return FloatArray(0)
+//
+//        val size = embeddings[0].size
+//        val centroid = FloatArray(size)
+//
+//        for (emb in embeddings) {
+//            for (i in emb.indices) {
+//                centroid[i] += emb[i]
 //            }
-//            return last.id
 //        }
 //
-//        // New profile
-//        val id = profileIdCounter.getAndIncrement()
-//        val profile = SpeakerProfile(id = id, lastActiveTime = timestamp, totalSamples = 0, pendingWarmup = 1)
-//        profile.features.add(features)
-//
-//        speakerProfiles.add(profile)
-//        Log.d(TAG, "Created new pending speaker: $id")
-//
-//        if (warmupFramesBeforeCreate == 1) {
-//            profile.totalSamples = 1
-//            Log.d(TAG, "Speaker $id confirmed immediately.")
+//        for (i in centroid.indices) {
+//            centroid[i] /= embeddings.size
 //        }
 //
-//        return id
+//        return centroid
 //    }
-//
-//    // -------------------------------------------------------------------
-//
-//    private fun updateSpeakerProfile(id: Int, features: FloatArray, timestamp: Long) {
-//        val p = speakerProfiles.find { it.id == id } ?: return
-//
-//        p.features.add(features)
-//        p.totalSamples++
-//        p.lastActiveTime = timestamp
-//        p.pendingWarmup = 0
-//
-//        if (p.features.size > embeddingWindowSize) {
-//            p.features.removeAt(0)
-//        }
-//
-//        Log.d(TAG, "Updated speaker $id (samples=${p.totalSamples})")
-//    }
-//
-//    // -------------------------------------------------------------------
 //
 //    private fun cosineSimilarity(a: FloatArray, b: FloatArray): Float {
+//        if (a.size != b.size || a.isEmpty()) return -1f
+//
 //        var dot = 0f
-//        var na = 0f
-//        var nb = 0f
+//        var normA = 0f
+//        var normB = 0f
 //
 //        for (i in a.indices) {
 //            dot += a[i] * b[i]
-//            na += a[i] * a[i]
-//            nb += b[i] * b[i]
+//            normA += a[i] * a[i]
+//            normB += b[i] * b[i]
 //        }
 //
-//        val denom = sqrt(na * nb)
-//        if (denom == 0f) return -1f
-//        return (dot / denom).coerceIn(-1f, 1f)
+//        val denom = sqrt(normA * normB)
+//        return if (denom < 1e-12f) -1f else (dot / denom).coerceIn(-1f, 1f)
 //    }
 //
-//    private fun l2NormalizeCopy(v: FloatArray): FloatArray {
-//        val out = v.copyOf()
-//        var sum = 0f
-//        for (x in out) sum += x * x
-//        val norm = sqrt(sum)
-//        if (norm < 1e-9) return out
-//        for (i in out.indices) out[i] /= norm
-//        return out
-//    }
+//    fun getSpeakerCount(): Int = profiles.size
 //
-//    private fun averageFeatures(list: List<FloatArray>): FloatArray {
-//        val size = list[0].size
-//        val avg = FloatArray(size)
-//
-//        for (v in list) {
-//            for (i in 0 until size) avg[i] += v[i]
-//        }
-//        for (i in 0 until size) avg[i] /= list.size
-//
-//        return l2NormalizeCopy(avg)
-//    }
-//
-//    companion object {
-//        private const val TAG = "SpeakerDiarizer"
+//    fun getDebugInfo(): String {
+//        return "Speakers: ${profiles.size}, Current: S${currentSpeaker?.plus(1) ?: "none"}"
 //    }
 //}
-
 
 package com.echosense.audio
 
 import android.util.Log
-import kotlin.math.*
+import kotlin.math.sqrt
 
 class SpeakerDiarizer(
-    private val maxSpeakers: Int = 4,
-    private val similarityThreshold: Float = 0.72f,  // tuned for 39-dim MFCC
-    private val windowSize: Int = 10
+    private val maxSpeakers: Int = 6,
+    private val similarityThreshold: Float = 0.75f,      // NEW: more sensitive
+    private val marginThreshold: Float = 0.10f,          // NEW: detects close voices as new speaker
+    private val minSwitchDelayMs: Long = 300             // NEW: much faster switching
 ) {
 
-    private val profiles = mutableListOf<SpeakerProfile>()
-    private var currentSpeaker: Int? = null
+    private val TAG = "DIAR"
+
+    private val speakerProfiles = mutableListOf<FloatArray>()
+    private var lastSpeaker: Int? = null
     private var lastSwitchTime = 0L
 
-    private val minSwitchDelay = 800L // ms
+    fun getSpeakerCount(): Int = speakerProfiles.size
 
-    data class SpeakerProfile(
-        val id: Int,
-        val embeddings: MutableList<FloatArray> = mutableListOf()
-    )
-
-    fun reset() {
-        profiles.clear()
-        currentSpeaker = null
-    }
-
-    fun process(features: FloatArray, timestamp: Long): Int? {
-        if (features.isEmpty()) return currentSpeaker
-
-        val normalized = l2norm(features)
-
-        if (profiles.isEmpty()) {
-            return createSpeaker(normalized)
-        }
-
-        // find best profile
-        var bestId = -1
-        var bestSim = -2f
-
-        for (p in profiles) {
-            val centroid = computeCentroid(p.embeddings)
-            val sim = cosine(centroid, normalized)
-
-            Log.d("DIAR", "Speaker ${p.id+1} sim: $sim")
-
-            if (sim > bestSim) {
-                bestSim = sim
-                bestId = p.id
-            }
-        }
-
-        Log.d("DIAR", "Best sim=$bestSim (th=$similarityThreshold)")
-
-        // matched?
-        if (bestSim >= similarityThreshold) {
-            updateSpeaker(bestId, normalized)
-            trySwitch(bestId, timestamp)
-            return currentSpeaker
-        }
-
-        // new speaker?
-        if (profiles.size < maxSpeakers) {
-            val newId = createSpeaker(normalized)
-            trySwitch(newId, timestamp)
-            return newId
-        }
-
-        // fallback: use best match anyway
-        updateSpeaker(bestId, normalized)
-        trySwitch(bestId, timestamp)
-        return bestId
-    }
-
-    private fun trySwitch(id: Int, timestamp: Long) {
-        val now = timestamp
-        if (currentSpeaker == null || currentSpeaker != id) {
-            if (now - lastSwitchTime > minSwitchDelay) {
-                currentSpeaker = id
-                lastSwitchTime = now
-                Log.d("DIAR", "Switched → Speaker ${id+1}")
-            }
-        }
-    }
-
-    private fun createSpeaker(vec: FloatArray): Int {
-        val newId = profiles.size
-        val sp = SpeakerProfile(newId)
-        sp.embeddings.add(vec)
-        profiles.add(sp)
-
-        Log.d("DIAR", "New speaker created: ${newId+1}")
-        return newId
-    }
-
-    private fun updateSpeaker(id: Int, vec: FloatArray) {
-        val p = profiles[id]
-        p.embeddings.add(vec)
-
-        if (p.embeddings.size > windowSize)
-            p.embeddings.removeAt(0)
-    }
-
-    private fun computeCentroid(list: List<FloatArray>): FloatArray {
-        val out = FloatArray(list[0].size)
-        for (f in list) for (i in f.indices) out[i] += f[i]
-        for (i in out.indices) out[i] /= list.size
-        return out
+    // L2 Normalize embeddings → improves separation
+    private fun normalize(e: FloatArray): FloatArray {
+        val norm = sqrt(e.sumOf { (it * it).toDouble() }).toFloat()
+        return if (norm > 0) FloatArray(e.size) { i -> e[i] / norm } else e
     }
 
     private fun cosine(a: FloatArray, b: FloatArray): Float {
@@ -378,18 +305,64 @@ class SpeakerDiarizer(
             na += a[i] * a[i]
             nb += b[i] * b[i]
         }
-
-        val denom = sqrt(na * nb)
-        return if (denom == 0f) -1f else (dot / denom).coerceIn(-1f, 1f)
+        return (dot / (sqrt(na) * sqrt(nb))).coerceIn(-1f, 1f)
     }
 
-    private fun l2norm(v: FloatArray): FloatArray {
-        val out = v.copyOf()
-        var sum = 0f
-        for (x in out) sum += x * x
-        val n = sqrt(sum)
-        if (n < 1e-9f) return out
-        for (i in out.indices) out[i] /= n
-        return out
+    fun process(embeddingRaw: FloatArray, timestampMs: Long): Int? {
+        if (embeddingRaw.isEmpty()) return lastSpeaker
+
+        // Normalize for stability
+        val embedding = normalize(embeddingRaw)
+
+        // If no profiles → first speaker
+        if (speakerProfiles.isEmpty()) {
+            speakerProfiles.add(embedding)
+            lastSpeaker = 0
+            lastSwitchTime = timestampMs
+            Log.d(TAG, "🆕 Created Speaker 1 (initial)")
+            return 0
+        }
+
+        // Calculate similarities to all known speakers
+        val similarities = speakerProfiles.map { cosine(embedding, it) }
+        val bestSim = similarities.maxOrNull() ?: -1f
+        val bestIndex = similarities.indexOf(bestSim)
+
+        Log.d(TAG, "📊 Similarities: " + similarities.map { "%.3f".format(it) })
+
+        val margin = 1 - bestSim
+        Log.d(TAG, "📐 Margin = %.3f".format(margin))
+
+        // --- NEW SPEAKER CREATION RULES ---
+        val shouldCreateNew =
+            bestSim < similarityThreshold ||       // not similar enough
+                    margin < marginThreshold ||            // too close → probably different
+                    (lastSpeaker != null &&
+                            bestIndex != lastSpeaker &&
+                            bestSim - (similarities[lastSpeaker!!]) < 0.12f)  // difference spike
+
+        // --- RATE LIMIT SWITCHING ---
+        val elapsed = timestampMs - lastSwitchTime
+        val canSwitch = elapsed > minSwitchDelayMs
+
+        if (shouldCreateNew && speakerProfiles.size < maxSpeakers) {
+            speakerProfiles.add(embedding)
+            val newId = speakerProfiles.lastIndex
+            lastSpeaker = newId
+            lastSwitchTime = timestampMs
+            Log.d(TAG, "🆕 Created Speaker ${newId + 1}")
+            return newId
+        }
+
+        if (!canSwitch) {
+            return lastSpeaker
+        }
+
+        // Assign to best matching speaker
+        lastSpeaker = bestIndex
+        lastSwitchTime = timestampMs
+
+        Log.d(TAG, "🎯 Strong match → Speaker ${bestIndex + 1}")
+        return bestIndex
     }
 }

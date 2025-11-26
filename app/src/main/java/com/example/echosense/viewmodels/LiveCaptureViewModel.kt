@@ -4,7 +4,7 @@ import android.content.Context
 import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
-import com.echosense.audio.AudioProcessor
+import com.echosense.audio.WeSpeakerEmbedding
 import com.example.echosense.audio.AudioRecorder
 import com.echosense.audio.SpeakerDiarizer
 import com.echosense.db.AppDatabase
@@ -26,7 +26,7 @@ import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.*
 import java.util.concurrent.Executors
-import kotlin.math.abs
+import kotlin.math.sqrt
 
 data class LiveCaptureUiState(
     val isRecording: Boolean = false,
@@ -48,14 +48,19 @@ class LiveCaptureViewModel(private val maxSpeakers: Int = 4) : ViewModel() {
 
     private val TAG = "LiveCaptureVM"
 
-    // Single-thread dispatcher for Vosk calls
-    private val voskDispatcher = Executors.newSingleThreadExecutor().asCoroutineDispatcher()
+    private val voskDispatcher = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "VoskThread").apply { priority = Thread.MAX_PRIORITY }
+    }.asCoroutineDispatcher()
+
+    private val diarizationDispatcher = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "DiarizationThread").apply { priority = Thread.NORM_PRIORITY }
+    }.asCoroutineDispatcher()
 
     private val _uiState = MutableStateFlow(LiveCaptureUiState(maxSpeakers = maxSpeakers))
     val uiState: StateFlow<LiveCaptureUiState> = _uiState.asStateFlow()
 
     private val audioRecorder = AudioRecorder()
-    private val audioProcessor = AudioProcessor()
+    private var weSpeakerEmbedding: WeSpeakerEmbedding? = null
     private lateinit var speakerDiarizer: SpeakerDiarizer
     private var currentContext: Context? = null
 
@@ -64,20 +69,38 @@ class LiveCaptureViewModel(private val maxSpeakers: Int = 4) : ViewModel() {
     private var recordingStartTime: Long = 0
     private var currentDatabase: AppDatabase? = null
 
-    // Vosk offline STT
     private var voskModel: Model? = null
     private var voskRecognizer: Recognizer? = null
     private var isModelLoaded = false
 
-    // Accumulator to buffer several frames before feeding to Vosk
     private val voskAccumulator = ByteArrayOutputStream()
-    private val MIN_BYTES_FOR_VOSK = 3200
+    private val MIN_BYTES_FOR_VOSK = 12800
 
-    // Speaker tracking
     private val createdSpeakers = mutableSetOf<Int>()
+
+    // FIXED: Separate accumulator for each potential speaker
+    private val audioAccumulator = mutableListOf<Short>()
+    private val MIN_SAMPLES_FOR_EMBEDDING = 16000  // 1 second minimum
+    private val MAX_SAMPLES_FOR_EMBEDDING = 64000  // 4 seconds max (increased!)
+
+    // FIXED: More lenient VAD
+    private val SILENCE_THRESHOLD = 500  // Lower for better detection
+    private var consecutiveSilentFrames = 0
+    private val MAX_SILENT_FRAMES_BEFORE_CLEAR = 30  // 600ms silence (increased!)
+
+    private var lastEmbeddingTime = 0L
+    private val EMBEDDING_INTERVAL_MS = 1500L  // Process every 1.5 seconds
+
+    private var frameCount = 0
+    private val GC_TRIGGER_INTERVAL = 300
 
     init {
         speakerDiarizer = SpeakerDiarizer(maxSpeakers = maxSpeakers)
+    }
+
+    private fun hasSpeech(audioFrame: ShortArray): Boolean {
+        val rms = sqrt(audioFrame.map { it * it.toDouble() }.average())
+        return rms > SILENCE_THRESHOLD
     }
 
     fun startRecording(context: Context) {
@@ -100,12 +123,27 @@ class LiveCaptureViewModel(private val maxSpeakers: Int = 4) : ViewModel() {
 
             audioFile = File(context.filesDir, "audio_$currentSessionId.pcm")
 
-            // Register audio listeners
+            try {
+                weSpeakerEmbedding = WeSpeakerEmbedding(context)
+                Log.d(TAG, "✅ WeSpeaker initialized")
+            } catch (e: Exception) {
+                Log.e(TAG, "❌ Failed to initialize WeSpeaker", e)
+                withContext(Dispatchers.Main) {
+                    _uiState.value = _uiState.value.copy(
+                        errorMessage = "Speaker detection unavailable",
+                        recognitionMode = "STT Only"
+                    )
+                }
+            }
+
             audioRecorder.addAudioDataListener { frame ->
                 processAudioData(frame)
             }
+
             audioRecorder.addAmplitudeListener { amplitude ->
-                _uiState.value = _uiState.value.copy(currentAmplitude = amplitude)
+                viewModelScope.launch(Dispatchers.Main) {
+                    _uiState.value = _uiState.value.copy(currentAmplitude = amplitude)
+                }
             }
 
             recordingStartTime = System.currentTimeMillis()
@@ -114,24 +152,38 @@ class LiveCaptureViewModel(private val maxSpeakers: Int = 4) : ViewModel() {
             withContext(Dispatchers.Main) {
                 _uiState.value = _uiState.value.copy(
                     isRecording = started,
-                    processingStatus = if (started) "Audio recording started" else "Failed to start"
+                    processingStatus = if (started) "Recording..." else "Failed to start"
                 )
             }
 
             if (!started) return@launch
 
             delay(500)
-
-            // Load Vosk model in background
             loadVoskModelSafely(context)
         }
     }
 
-    // CRITICAL FIX: Ensure speaker exists in database
+    private fun handleSpeakerChange(newSpeakerId: Int?) {
+        viewModelScope.launch(Dispatchers.Main) {
+            val previousSpeaker = _uiState.value.activeSpeaker
+
+            if (newSpeakerId != null && newSpeakerId != previousSpeaker) {
+                _uiState.value = _uiState.value.copy(activeSpeaker = newSpeakerId)
+                ensureSpeakerExists(newSpeakerId)
+
+                _uiState.value = _uiState.value.copy(
+                    processingStatus = "Speaker ${newSpeakerId + 1} speaking",
+                    detectedSpeakers = speakerDiarizer.getSpeakerCount()
+                )
+
+                Log.d(TAG, "🎤 Active Speaker: ${newSpeakerId + 1}, Total: ${speakerDiarizer.getSpeakerCount()}")
+            }
+        }
+    }
+
     private fun ensureSpeakerExists(speakerId: Int) {
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                // Check if we already created this speaker in this session
                 if (createdSpeakers.contains(speakerId)) {
                     return@launch
                 }
@@ -139,7 +191,6 @@ class LiveCaptureViewModel(private val maxSpeakers: Int = 4) : ViewModel() {
                 val existingSpeaker = currentDatabase?.sessionDao()?.getSpeaker(currentSessionId, speakerId.toLong())
 
                 if (existingSpeaker == null) {
-                    // Create new speaker entity
                     val colors = listOf(
                         0xFF00BCD4.toInt(), 0xFFFF9800.toInt(), 0xFF9C27B0.toInt(),
                         0xFF4CAF50.toInt(), 0xFFE91E63.toInt(), 0xFFFFEB3B.toInt()
@@ -147,7 +198,7 @@ class LiveCaptureViewModel(private val maxSpeakers: Int = 4) : ViewModel() {
                     val color = colors[speakerId % colors.size]
 
                     val speaker = Speaker(
-                        id = speakerId.toLong(),  // Use the same ID as in diarization
+                        id = speakerId.toLong(),
                         sessionId = currentSessionId,
                         speakerLabel = "Speaker ${speakerId + 1}",
                         color = color,
@@ -158,13 +209,13 @@ class LiveCaptureViewModel(private val maxSpeakers: Int = 4) : ViewModel() {
                     currentDatabase?.sessionDao()?.insertSpeaker(speaker)
                     createdSpeakers.add(speakerId)
 
-                    // Update UI with current speaker count
                     val speakerCount = currentDatabase?.sessionDao()?.getSpeakerCount(currentSessionId) ?: 0
+
                     withContext(Dispatchers.Main) {
                         _uiState.value = _uiState.value.copy(detectedSpeakers = speakerCount)
                     }
 
-                    Log.d(TAG, "✅ CREATED Speaker ${speakerId + 1} in database. Total: $speakerCount")
+                    Log.d(TAG, "✅ Created Speaker ${speakerId + 1}. Database Total: $speakerCount")
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "❌ Error creating speaker", e)
@@ -174,50 +225,46 @@ class LiveCaptureViewModel(private val maxSpeakers: Int = 4) : ViewModel() {
 
     private suspend fun loadVoskModelSafely(context: Context) = withContext(Dispatchers.IO) {
         try {
-            Log.d(TAG, "Starting Vosk model loading...")
-            _uiState.value = _uiState.value.copy(processingStatus = "Loading speech model...")
+            Log.d(TAG, "Loading Vosk model...")
+            withContext(Dispatchers.Main) {
+                _uiState.value = _uiState.value.copy(processingStatus = "Loading speech model...")
+            }
 
             val modelDir = File(context.filesDir, "vosk-model-small-en-us-0.15")
 
             if (!modelDir.exists() || !File(modelDir, "am/final.mdl").exists()) {
-                Log.d(TAG, "Extracting model from assets...")
-                _uiState.value = _uiState.value.copy(processingStatus = "Extracting model (first time)...")
+                withContext(Dispatchers.Main) {
+                    _uiState.value = _uiState.value.copy(processingStatus = "Extracting model...")
+                }
                 extractAssetToStorage(context, "vosk-model-small-en-us-0.15", modelDir)
-                Log.d(TAG, "Model extracted successfully")
             }
 
             if (!verifyModelFiles(modelDir)) {
-                throw IOException("Model files incomplete or corrupted")
+                throw IOException("Model files incomplete")
             }
 
-            Log.d(TAG, "Loading Vosk model from: ${modelDir.absolutePath}")
-            _uiState.value = _uiState.value.copy(processingStatus = "Initializing speech engine...")
-
             voskModel = Model(modelDir.absolutePath)
-            val sampleRate = audioRecorder.getSampleRate().toFloat()
-            voskRecognizer = Recognizer(voskModel, sampleRate)
+            voskRecognizer = Recognizer(voskModel, audioRecorder.getSampleRate().toFloat())
+
+            voskRecognizer?.setMaxAlternatives(0)
+            voskRecognizer?.setWords(true)
 
             isModelLoaded = true
-            Log.d(TAG, "Vosk model loaded successfully (${sampleRate}Hz)")
+            Log.d(TAG, "✅ Vosk loaded")
 
             withContext(Dispatchers.Main) {
+                val mode = if (weSpeakerEmbedding != null) "Full AI Mode" else "STT Only"
                 _uiState.value = _uiState.value.copy(
-                    recognitionMode = "Offline (Vosk)",
-                    processingStatus = "Ready - Speak now",
+                    recognitionMode = mode,
+                    processingStatus = "Ready - Speak clearly",
                     isListening = true,
                     errorMessage = ""
                 )
             }
 
-        } catch (e: OutOfMemoryError) {
-            Log.e(TAG, "Out of memory loading Vosk model", e)
-            handleModelLoadFailure("Out of memory - Model too large")
-        } catch (e: IOException) {
-            Log.e(TAG, "IO error loading Vosk model", e)
-            handleModelLoadFailure("Model files not found or corrupted")
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to load Vosk model", e)
-            handleModelLoadFailure("Failed to load model: ${e.message}")
+            Log.e(TAG, "Failed to load Vosk", e)
+            handleModelLoadFailure("STT unavailable: ${e.message}")
         }
     }
 
@@ -252,14 +299,7 @@ class LiveCaptureViewModel(private val maxSpeakers: Int = 4) : ViewModel() {
             "graph/HCLr.fst",
             "graph/Gr.fst"
         )
-
-        for (file in requiredFiles) {
-            if (!File(modelDir, file).exists()) {
-                Log.e(TAG, "Missing required file: $file")
-                return false
-            }
-        }
-        return true
+        return requiredFiles.all { File(modelDir, it).exists() }
     }
 
     private suspend fun handleModelLoadFailure(message: String) = withContext(Dispatchers.Main) {
@@ -274,80 +314,125 @@ class LiveCaptureViewModel(private val maxSpeakers: Int = 4) : ViewModel() {
     private fun processAudioData(frame: ShortArray) {
         if (_uiState.value.isPaused) return
 
-        viewModelScope.launch(Dispatchers.Default) {
-            val timeFromStart = System.currentTimeMillis() - recordingStartTime
+        frameCount++
 
-            try {
-                // === SPEAKER DIARIZATION WITH NEW LOGIC ===
+        if (frameCount % GC_TRIGGER_INTERVAL == 0) {
+            System.gc()
+        }
 
-                // Extract 39-dim MFCC features using new AudioProcessor
-                val mfccFeatures = audioProcessor.extractEnhancedMFCC(
-                    frame,
-                    audioRecorder.getSampleRate()
-                )
+        val timeFromStart = System.currentTimeMillis() - recordingStartTime
+        val hasVoice = hasSpeech(frame)
 
-                Log.d(TAG, "🎤 Extracted MFCC features: ${mfccFeatures.size} dims")
+        if (hasVoice) {
+            consecutiveSilentFrames = 0
 
-                // Process with new SpeakerDiarizer
-                val speakerId = if (mfccFeatures.isNotEmpty()) {
-                    speakerDiarizer.process(mfccFeatures, timeFromStart)
-                } else {
-                    null
-                }
+            // === SPEAKER DIARIZATION - FIXED ===
+            if (weSpeakerEmbedding != null) {
+                viewModelScope.launch(diarizationDispatcher) {
+                    try {
+                        // ALWAYS accumulate audio
+                        synchronized(audioAccumulator) {
+                            audioAccumulator.addAll(frame.toList())
 
-                Log.d(TAG, "🎯 DIARIZATION RESULT: Speaker ${(speakerId ?: -1) + 1}")
-
-                if (speakerId != null) {
-                    // ENSURE SPEAKER EXISTS IN DATABASE
-                    ensureSpeakerExists(speakerId)
-
-                    // Update UI immediately if speaker changed
-                    if (speakerId != _uiState.value.activeSpeaker) {
-                        withContext(Dispatchers.Main) {
-                            _uiState.value = _uiState.value.copy(activeSpeaker = speakerId)
-                            Log.d(TAG, "🔄 SPEAKER CHANGED TO: ${speakerId + 1}")
+                            // Only trim if too large
+                            if (audioAccumulator.size > MAX_SAMPLES_FOR_EMBEDDING) {
+                                val excess = audioAccumulator.size - MAX_SAMPLES_FOR_EMBEDDING
+                                audioAccumulator.subList(0, excess).clear()
+                            }
                         }
+
+                        // Extract embedding at intervals
+                        if (timeFromStart - lastEmbeddingTime >= EMBEDDING_INTERVAL_MS) {
+                            val currentSize = synchronized(audioAccumulator) { audioAccumulator.size }
+
+                            if (currentSize >= MIN_SAMPLES_FOR_EMBEDDING) {
+                                val audioChunk: ShortArray
+                                synchronized(audioAccumulator) {
+                                    audioChunk = audioAccumulator.toShortArray()
+                                    // Keep 0.5s overlap for continuity
+                                    val keepSamples = 8000
+                                    if (audioAccumulator.size > keepSamples) {
+                                        val removeCount = audioAccumulator.size - keepSamples
+                                        audioAccumulator.subList(0, removeCount).clear()
+                                    }
+                                }
+
+                                Log.d(TAG, "🎵 Processing ${audioChunk.size} samples (${audioChunk.size / 16}ms)")
+
+                                val embedding = weSpeakerEmbedding?.extractEmbedding(audioChunk)
+
+                                if (embedding != null && embedding.isNotEmpty()) {
+                                    lastEmbeddingTime = timeFromStart
+
+                                    val speakerId = speakerDiarizer.process(embedding, timeFromStart)
+
+                                    Log.d(TAG, "🎯 Diarizer returned: Speaker ${speakerId?.plus(1) ?: "null"}, Total profiles: ${speakerDiarizer.getSpeakerCount()}")
+
+                                    if (speakerId != null) {
+                                        handleSpeakerChange(speakerId)
+                                    }
+                                } else {
+                                    Log.w(TAG, "⚠️ Embedding extraction returned null/empty")
+                                }
+                            } else {
+                                Log.d(TAG, "⏳ Waiting for more audio: $currentSize / $MIN_SAMPLES_FOR_EMBEDDING samples")
+                            }
+                        }
+
+                    } catch (e: Exception) {
+                        Log.e(TAG, "❌ Diarization error", e)
+                        e.printStackTrace()
                     }
                 }
-
-            } catch (e: Exception) {
-                Log.e(TAG, "Speaker diarization error", e)
             }
+        } else {
+            consecutiveSilentFrames++
 
-            // === VOSK SPEECH RECOGNITION ===
+            // FIXED: Don't clear accumulator too aggressively
+            if (consecutiveSilentFrames > MAX_SILENT_FRAMES_BEFORE_CLEAR) {
+                synchronized(audioAccumulator) {
+                    // Keep last 0.5s instead of clearing completely
+                    val keepSamples = 8000
+                    if (audioAccumulator.size > keepSamples) {
+                        val removeCount = audioAccumulator.size - keepSamples
+                        audioAccumulator.subList(0, removeCount).clear()
+                        Log.d(TAG, "🧹 Trimmed to ${audioAccumulator.size} samples during silence")
+                    }
+                }
+            }
+        }
+
+        // === VOSK STT ===
+        viewModelScope.launch(voskDispatcher) {
             try {
+                if (!isModelLoaded || voskRecognizer == null) return@launch
+
                 val bytes = frame.toByteArrayLE()
 
-                if (isModelLoaded && voskRecognizer != null) {
-                    synchronized(voskAccumulator) {
-                        voskAccumulator.write(bytes)
-                    }
-
-                    if (voskAccumulator.size() < MIN_BYTES_FOR_VOSK) return@launch
-
-                    val chunk: ByteArray
-                    synchronized(voskAccumulator) {
-                        chunk = voskAccumulator.toByteArray()
-                        voskAccumulator.reset()
-                    }
-
-                    viewModelScope.launch(voskDispatcher) {
-                        try {
-                            val isFinal = voskRecognizer!!.acceptWaveForm(chunk, chunk.size)
-                            if (isFinal) {
-                                val jsonStr = voskRecognizer!!.result
-                                handleVoskJson(jsonStr, true)
-                            } else {
-                                val jsonStr = voskRecognizer!!.partialResult
-                                handleVoskJson(jsonStr, false)
-                            }
-                        } catch (e: Exception) {
-                            Log.e(TAG, "Vosk processing error", e)
-                        }
-                    }
+                synchronized(voskAccumulator) {
+                    voskAccumulator.write(bytes)
                 }
+
+                if (voskAccumulator.size() < MIN_BYTES_FOR_VOSK) return@launch
+
+                val chunk: ByteArray
+                synchronized(voskAccumulator) {
+                    chunk = voskAccumulator.toByteArray()
+                    voskAccumulator.reset()
+                }
+
+                val isFinal = voskRecognizer!!.acceptWaveForm(chunk, chunk.size)
+
+                if (isFinal) {
+                    val jsonStr = voskRecognizer!!.result
+                    handleVoskJson(jsonStr, true)
+                } else {
+                    val jsonStr = voskRecognizer!!.partialResult
+                    handleVoskJson(jsonStr, false)
+                }
+
             } catch (e: Exception) {
-                Log.e(TAG, "Vosk processing error", e)
+                Log.e(TAG, "Vosk error", e)
             }
         }
     }
@@ -360,26 +445,26 @@ class LiveCaptureViewModel(private val maxSpeakers: Int = 4) : ViewModel() {
 
             if (!isFinal && obj.has("partial")) {
                 val partial = obj.getString("partial")
-                if (partial.isNotBlank()) {
+                if (partial.length > 3) {
                     withContext(Dispatchers.Main) {
                         _uiState.value = _uiState.value.copy(
                             currentPartialText = partial,
-                            processingStatus = "Recognizing..."
+                            processingStatus = "Listening..."
                         )
                     }
                 }
             }
 
             if (isFinal && obj.has("text")) {
-                val text = obj.getString("text")
-                if (text.isNotBlank()) {
-                    Log.d(TAG, "Recognized: '$text'")
+                val text = obj.getString("text").trim()
+                if (text.length > 2) {
+                    Log.d(TAG, "✅ Recognized: '$text'")
                     addTranscriptEntry(text, 0.85f)
 
                     withContext(Dispatchers.Main) {
                         _uiState.value = _uiState.value.copy(
                             currentPartialText = "",
-                            processingStatus = "Added transcript"
+                            processingStatus = "Added: ${text.take(20)}..."
                         )
                     }
                 }
@@ -395,7 +480,6 @@ class LiveCaptureViewModel(private val maxSpeakers: Int = 4) : ViewModel() {
                 val currentTime = System.currentTimeMillis() - recordingStartTime
                 val speakerId = _uiState.value.activeSpeaker?.toLong() ?: 0L
 
-                // Ensure speaker exists before creating transcript
                 ensureSpeakerExists(speakerId.toInt())
 
                 val entry = TranscriptEntry(
@@ -409,16 +493,16 @@ class LiveCaptureViewModel(private val maxSpeakers: Int = 4) : ViewModel() {
                 )
 
                 currentDatabase?.sessionDao()?.insertTranscriptEntry(entry)
-                val currentEntries = _uiState.value.transcriptEntries.toMutableList()
-                currentEntries.add(entry)
 
                 withContext(Dispatchers.Main) {
+                    val currentEntries = _uiState.value.transcriptEntries.toMutableList()
+                    currentEntries.add(entry)
                     _uiState.value = _uiState.value.copy(
                         transcriptEntries = currentEntries
                     )
                 }
 
-                Log.d(TAG, "📝 Transcript added for Speaker ${speakerId + 1}: $text")
+                Log.d(TAG, "📝 Transcript for Speaker ${speakerId + 1}: $text")
             } catch (e: Exception) {
                 Log.e(TAG, "Error adding transcript", e)
             }
@@ -473,51 +557,47 @@ class LiveCaptureViewModel(private val maxSpeakers: Int = 4) : ViewModel() {
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 audioRecorder.stopRecording()
-                Log.d(TAG, "Audio recorder stopped")
+                Log.d(TAG, "🛑 Audio stopped")
             } catch (e: Exception) {
                 Log.e(TAG, "Error stopping recorder", e)
             }
 
-            // Close Vosk resources
             try {
                 voskRecognizer?.close()
                 voskRecognizer = null
-                Log.d(TAG, "Recognizer closed")
-            } catch (e: Exception) {
-                Log.e(TAG, "Error closing recognizer", e)
-            }
+            } catch (e: Exception) {}
 
             try {
                 voskModel?.close()
                 voskModel = null
                 isModelLoaded = false
-                Log.d(TAG, "Model closed")
-            } catch (e: Exception) {
-                Log.e(TAG, "Error closing model", e)
-            }
+            } catch (e: Exception) {}
+
+            try {
+                weSpeakerEmbedding?.close()
+                weSpeakerEmbedding = null
+            } catch (e: Exception) {}
 
             try {
                 val db = currentDatabase ?: AppDatabase.getDatabase(context)
                 val endTime = System.currentTimeMillis()
                 val duration = endTime - recordingStartTime
 
-                // GET REAL SPEAKER COUNT FROM DATABASE
                 val actualSpeakerCount = db.sessionDao().getUniqueSpeakerCount(currentSessionId)
-                Log.d(TAG, "🎉 FINAL SPEAKER COUNT: $actualSpeakerCount")
+                Log.d(TAG, "🎉 FINAL SPEAKERS: $actualSpeakerCount")
 
                 val s = db.sessionDao().getSession(currentSessionId)
                 s?.let {
                     val updated = it.copy(
                         endTime = endTime,
                         duration = duration,
-                        speakerCount = actualSpeakerCount,  // REAL COUNT!
+                        speakerCount = actualSpeakerCount,
                         audioFilePath = audioFile?.absolutePath,
                         isCompleted = true
                     )
                     db.sessionDao().updateSession(updated)
                 }
 
-                // Extract notes from transcript
                 val transcript = db.sessionDao().getTranscriptForSession(currentSessionId)
                 if (transcript.isNotEmpty()) {
                     val extractor = com.echosense.ml.NoteExtractor()
@@ -541,17 +621,22 @@ class LiveCaptureViewModel(private val maxSpeakers: Int = 4) : ViewModel() {
             voskModel?.close()
             audioRecorder.stopRecording()
             speakerDiarizer.reset()
-            audioProcessor.reset()
+            weSpeakerEmbedding?.close()
+
             try {
                 (voskDispatcher.executor as? java.util.concurrent.ExecutorService)?.shutdownNow()
             } catch (_: Exception) {}
+
+            try {
+                (diarizationDispatcher.executor as? java.util.concurrent.ExecutorService)?.shutdownNow()
+            } catch (_: Exception) {}
+
             Log.d(TAG, "ViewModel cleared")
         } catch (e: Exception) {
             Log.e(TAG, "Error in onCleared", e)
         }
     }
 
-    // Helper functions
     private fun ShortArray.toByteArrayLE(): ByteArray {
         val b = ByteArray(this.size * 2)
         var idx = 0
@@ -562,4 +647,8 @@ class LiveCaptureViewModel(private val maxSpeakers: Int = 4) : ViewModel() {
         }
         return b
     }
+}
+
+private fun SpeakerDiarizer.reset() {
+    TODO("Not yet implemented")
 }
